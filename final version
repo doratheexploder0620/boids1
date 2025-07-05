@@ -1,0 +1,331 @@
+import random as ran
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from scipy.spatial import Voronoi
+import scipy.spatial
+# To save and display the video file in the notebook
+from IPython.display import Video
+
+# Use a non-interactive backend for saving to a file, which is more reliable
+plt.switch_backend('Agg')
+
+
+class boidflock:
+    """
+    Manages the state and updates for a flock of boids with advanced neighbor-finding
+    and phase synchronization. This version is optimized to run faster by updating
+    neighbor lists intermittently.
+    """
+    def __init__(self, c, v, kus, ooo, n=15, w=300, h=300, dt=.05,
+                 radiusvel=40, radiuscohe=40, rradiusrep=30,
+                 angle=np.pi/4, alignp=1.0, cenp=1.0, repp=2.0):
+
+        # --- Core Properties ---
+        self.posv = c.astype(np.float64)
+        self.velv = v.astype(np.float64)
+        self.acc = np.zeros_like(self.posv)
+        self.number = n
+        self.width = w
+        self.height = h
+        self.time = dt
+
+        # --- Behavior Parameters ---
+        self.maxvel = 100.0
+        self.maxacc = 100.0
+        self.alignp = alignp
+        self.cenp = cenp
+        self.repp = repp
+
+        # --- Neighbor Finding Parameters ---
+        self.angle = angle
+        self.rr = rradiusrep
+
+        # --- Kuramoto Model Properties ---
+        self.theta = kus.astype(np.float64)
+        self.omega = ooo.astype(np.float64)
+
+        # --- Optimization Properties ---
+        self.frame_count = -1 # Start at -1 so the first frame always runs a full update
+        self.recalc_interval = 2 # How often to recalculate expensive neighbor lists
+        self.voronoi_neighbors = [] # Cached neighbor list
+        self.repel_neighbors = []   # Cached neighbor list
+
+        self.boidsx = self.posv[:, 0]
+        self.boidsy = self.posv[:, 1]
+
+    def pen(self):
+        """
+        Purpose: To handle periodic boundary conditions (screen wrapping).
+        It creates 8 'ghost' copies of the entire flock around the central
+        simulation area. This allows a boid near an edge to 'see' and react
+        to boids on the opposite edge as if the space were continuous.
+        """
+        p = self.posv
+        w, h = self.width, self.height
+        return np.vstack([
+            p,
+            p + [-w, h], p + [0, h], p + [w, h],
+            p + [-w, 0],           p + [w, 0],
+            p + [-w,-h], p + [0,-h], p + [w,-h]
+        ])
+
+    def neigh1(self, g):
+        """
+        Purpose: To find the 'topological' neighbors for each boid using a
+        Voronoi tessellation. Boids that share a boundary in the Voronoi
+        diagram are considered immediate neighbors.
+        """
+        ridge_points = g.ridge_points
+        neio = [[] for _ in range(self.number)]
+        for p1, p2 in ridge_points:
+            if p1 < self.number:
+                neio[p1].append(p2)
+            if p2 < self.number:
+                neio[p2].append(p1)
+        return [[n] for n in neio]
+
+    def dotfilter1(self, u):
+        """
+        Purpose: To filter a list of neighbors (from Voronoi) to include only
+        those within the boid's forward field of view. This makes the
+        simulation more realistic as boids don't react to neighbors behind them.
+        """
+        all_points = self.pen()
+        final_filtered_neighbors = [[] for _ in range(self.number)]
+
+        for i in range(self.number):
+            if np.linalg.norm(self.velv[i]) == 0:
+                continue
+            valid_neighbors = []
+            for neighbor_idx in u[i][0]:
+                vec_to_neighbor = all_points[neighbor_idx] - self.posv[i]
+                dist = np.linalg.norm(vec_to_neighbor)
+                if dist > 0:
+                    dot_product = np.dot(self.velv[i], vec_to_neighbor)
+                    denominator = (np.linalg.norm(self.velv[i]) * dist) + 1e-9
+                    cos_angle = dot_product / denominator
+                    if cos_angle > np.cos(self.angle):
+                        valid_neighbors.append(neighbor_idx)
+            final_filtered_neighbors[i] = [valid_neighbors]
+        return final_filtered_neighbors
+
+    def krepel1111(self, u):
+        """
+        Purpose: To calculate the separation (repulsion) force. Each boid
+        steers away from the average position of its very close neighbors
+        (found with a KD-Tree) to avoid crowding.
+        """
+        stoor = np.zeros((self.number, 2))
+        for kount, i_pos in enumerate(self.posv):
+            neighbors = [n for n in u[kount] if n != kount]
+            if neighbors:
+                desvel = np.mean(i_pos - self.pen()[neighbors], axis=0)
+                if np.linalg.norm(desvel) > 0:
+                    desvel = (desvel / np.linalg.norm(desvel)) * self.maxvel
+                    steer = desvel - self.velv[kount]
+                    if np.linalg.norm(steer) > 0:
+                        steer = (steer / np.linalg.norm(steer)) * self.maxacc
+                    stoor[kount] = steer
+        return stoor
+
+    def kvelalign1111(self, u):
+        """
+        Purpose: To calculate the alignment force. Each boid steers to match
+        the average velocity of its local (Voronoi) neighbors.
+        """
+        stoor = np.zeros((self.number, 2))
+        for i in range(self.number):
+            neighbors = u[i][0]
+            if neighbors:
+                neighbor_vels = self.velv[np.array(neighbors) % self.number]
+                desvel = np.mean(neighbor_vels, axis=0)
+                steer = desvel - self.velv[i]
+                if np.linalg.norm(steer) > 0:
+                    steer = (steer / np.linalg.norm(steer)) * self.maxacc
+                stoor[i] = steer
+        return stoor
+
+    def kcenter1111(self, u):
+        """
+        Purpose: To calculate the cohesion force. Each boid steers towards the
+        average position (center of mass) of its local (Voronoi) neighbors.
+        """
+        stoor = np.zeros((self.number, 2))
+        for i in range(self.number):
+            neighbors = u[i][0]
+            if neighbors:
+                neighbor_pos = self.pen()[neighbors]
+                center_pos = np.mean(neighbor_pos, axis=0)
+                steer = center_pos - self.posv[i]
+                if np.linalg.norm(steer) > 0:
+                    steer = (steer / np.linalg.norm(steer)) * self.maxacc
+                stoor[i] = steer
+        return stoor
+
+    def kthetaupdate111(self, dt, u, k=0.5):
+        """
+        Purpose: To update the internal phase angle (theta) of each boid based
+        on its neighbors' phases, following the Kuramoto model of synchronization.
+        """
+        for i in range(self.number):
+            neighbors = u[i][0]
+            sumsin = 0
+            if neighbors:
+                neighbor_thetas = self.theta[np.array(neighbors) % self.number]
+                sumsin = np.mean(np.sin(neighbor_thetas - self.theta[i]))
+            self.omega[i] += sumsin * k
+        self.theta += self.omega * dt
+
+    def boundries2(self):
+        """Purpose: A simpler boundary check using the modulo operator."""
+        self.posv[:, 0] %= self.width
+        self.posv[:, 1] %= self.height
+
+    def update1(self, dt=.05):
+        """
+        Purpose: To run one full step of the simulation, orchestrating all
+        the physics and behavior calculations. This is the main update loop.
+        """
+        self.frame_count += 1
+        if self.frame_count % self.recalc_interval == 0:
+            all_points = self.pen()
+            voronoi_neighbors_raw = self.neigh1(Voronoi(all_points))
+            self.voronoi_neighbors = self.dotfilter1(voronoi_neighbors_raw)
+            kdtree = scipy.spatial.KDTree(all_points)
+            self.repel_neighbors = kdtree.query_ball_point(self.posv, self.rr)
+
+        w = self.krepel1111(self.repel_neighbors)
+        q = self.kvelalign1111(self.voronoi_neighbors)
+        b = self.kcenter1111(self.voronoi_neighbors)
+
+        self.acc += self.alignp * q + self.cenp * b + self.repp * w
+        
+        acc_norms = np.linalg.norm(self.acc, axis=1)
+        mask_acc = acc_norms > self.maxacc
+        self.acc[mask_acc] = (self.acc[mask_acc].T / acc_norms[mask_acc] * self.maxacc).T
+
+        self.velv += self.acc * dt
+        vel_norms = np.linalg.norm(self.velv, axis=1)
+        mask_vel = vel_norms > self.maxvel
+        self.velv[mask_vel] = (self.velv[mask_vel].T / vel_norms[mask_vel] * self.maxvel).T
+
+        self.posv += self.velv * dt
+        self.boundries2()
+
+        self.kthetaupdate111(dt, self.voronoi_neighbors)
+
+        self.acc.fill(0)
+        self.boidsx = self.posv[:, 0]
+        self.boidsy = self.posv[:, 1]
+
+
+# --- DATA GENERATION AND ANALYSIS ---
+
+def calculate_entropy(positions, width, height, grid_size=30):
+    """Calculates the positional Shannon entropy of the flock."""
+    # Create a 2D histogram (count boids in each grid cell)
+    counts, _, _ = np.histogram2d(
+        positions[:, 0], positions[:, 1],
+        bins=grid_size, range=[[0, width], [0, height]]
+    )
+    # Calculate the probability distribution
+    total_boids = np.sum(counts)
+    if total_boids == 0:
+        return 0 # Return 0 if there are no boids
+        
+    probabilities = counts / total_boids
+    # Filter out zero probabilities to avoid log(0) errors
+    probabilities = probabilities[probabilities > 0]
+    # Calculate Shannon Entropy
+    entropy = -np.sum(probabilities * np.log2(probabilities))
+    return entropy
+
+def create_frame(flockobject, n_frames):
+    """Runs the simulation and stores the state and entropy of each frame."""
+    print("Running simulation to generate all frame data...")
+    # Array to hold [x, y, phase] for each boid at each frame
+    frame_data = np.zeros((n_frames, flockobject.number, 3))
+    # Array to hold the entropy value for each frame
+    entropy_history = np.zeros(n_frames)
+
+    for i in range(n_frames):
+        flockobject.update1()
+        frame_data[i, :, 0] = flockobject.boidsx
+        frame_data[i, :, 1] = flockobject.boidsy
+        frame_data[i, :, 2] = flockobject.theta
+        # Calculate and store entropy for the current frame
+        entropy_history[i] = calculate_entropy(flockobject.posv, flockobject.width, flockobject.height)
+
+    print("Simulation complete.")
+    return frame_data, entropy_history
+
+def map_phase_to_size(phases, min_size=20, max_size=250):
+    """Maps a phase angle to a pulsing size for a 'blink' effect."""
+    normalized_pulse = (np.sin(phases) + 1) / 2
+    return min_size + normalized_pulse * (max_size - min_size)
+
+def animate(i, all_frame_data, scatter_plot):
+    """Function called by FuncAnimation on each frame to UPDATE the plot."""
+    current_frame_data = all_frame_data[i]
+    scatter_plot.set_offsets(current_frame_data[:, 0:2])
+    sizes = map_phase_to_size(current_frame_data[:, 2])
+    scatter_plot.set_sizes(sizes)
+    return scatter_plot,
+
+# 1. SETUP INITIAL CONDITIONS
+nb = 50
+a = 300 * np.random.rand(nb, 2)
+wqwq = 50 * np.random.uniform(low=-1, high=1, size=(nb, 2))
+kus = 2 * np.pi * np.random.random(nb)
+omeg = np.ones(nb)
+flock = boidflock(a, wqwq, kus, omeg, n=nb) 
+
+# 2. RUN SIMULATION AND GET ALL DATA
+frames = 900
+simulation_data, entropy_data = create_frame(flock, frames)
+
+# 3. SETUP THE ANIMATION PLOT
+fig_anim, ax_anim = plt.subplots(figsize=(8, 8))
+ax_anim.set_xlim(0, flock.width)
+ax_anim.set_ylim(0, flock.height)
+ax_anim.set_facecolor('black')
+ax_anim.set_aspect('equal')
+ax_anim.set_title('Boids with Phase-Based Size ("Blinking")')
+
+initial_positions = simulation_data[0, :, 0:2]
+initial_sizes = map_phase_to_size(simulation_data[0, :, 2])
+scatter = ax_anim.scatter(
+    initial_positions[:, 0],
+    initial_positions[:, 1],
+    s=initial_sizes,
+    c='cyan',
+    alpha=0.8
+)
+
+anim = FuncAnimation(
+    fig_anim,
+    animate,
+    frames=frames,
+    fargs=(simulation_data, scatter),
+    interval=50,
+    blit=True
+)
+
+# 4. SAVE AND DISPLAY THE ANIMATION
+print("Saving animation to MP4 file... This may take a moment.")
+anim.save('boids_blinking_final.mp4', writer='ffmpeg', fps=20, dpi=120)
+print("File saved successfully!")
+plt.close(fig_anim)
+display(Video("boids_blinking_final.mp4", embed=True))
+
+# 5. CREATE AND DISPLAY THE STATIC ENTROPY PLOT
+print("Generating entropy plot...")
+fig_entropy, ax_entropy = plt.subplots(figsize=(10, 5))
+ax_entropy.plot(entropy_data)
+ax_entropy.set_xlabel("Frame Number")
+ax_entropy.set_ylabel("Positional Entropy (bits)")
+ax_entropy.set_title("Positional Entropy of the Flock Over Time")
+ax_entropy.grid(True)
+fig_entropy.savefig("entropy_plot.png")
+plt.show() # This will display the static plot in the output
