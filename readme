@@ -1,0 +1,15 @@
+this is a simulation of the boids model
+with twist 
+
+the boids act like fireflies , thet blink on and off , and can sync up , and the way that they classify their neighbours is through voronoi classificatiion 
+
+this was a project that i worked on a long time back but didnt upload the final version 
+i  have uploaded one of the final versions now , you can play withit to see how birds flock and fireflies sync up 
+i after making the simulation i kind of didnt do much with it for years 
+but now im uploading a better version to keep things clean 
+not as cool as the ising model sim 
+but my first simulation 
+
+the class that is defined contains the paramerters for almost averything in the simulation so change them and see if the boids flock or not , 
+  it can be built upon to see the evolution of order parameter 
+  and all that , to run it just copy and paste it into jupyter notebook , it should run just fine .
